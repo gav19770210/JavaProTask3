@@ -1,14 +1,10 @@
 package ru.gav19770210.javapro.task03;
 
-import lombok.Getter;
-
 import java.util.*;
 import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
 
 /*
 Попробуйте реализовать собственный пул потоков.
@@ -23,39 +19,34 @@ import java.util.concurrent.locks.ReentrantLock;
 Дополнительно можно добавить метод awaitTermination() без таймаута, работающий аналогично стандартным пулам потоков.
  */
 public class CustomThreadPool extends AbstractExecutorService {
-    private static final int RUNNING = 0;
-    private static final int SHUTDOWN = 1 << 1;
-    private static final int STOP = 1 << 2;
+    private static final int RUNNING = 1;
+    private static final int SHUTDOWN = 1 << 2;
     private static final int TERMINATED = 1 << 3;
     private final Deque<Runnable> workQueue = new LinkedList<>();
-    private final HashSet<TaskWorker> taskWorkers = new HashSet<>();
-    private final ReentrantLock mainLock = new ReentrantLock();
-    private final Condition termination = mainLock.newCondition();
+    private final HashSet<Thread> taskWorkers = new HashSet<>();
     private volatile int runState;
-    @Getter
-    private volatile ThreadFactory threadFactory = Executors.defaultThreadFactory();
 
     public CustomThreadPool(int corePoolSize) {
-        if (corePoolSize < 0) throw new IllegalArgumentException();
+        if (corePoolSize < 0)
+            throw new IllegalArgumentException();
         this.runState = RUNNING;
+        ThreadFactory threadFactory = Executors.defaultThreadFactory();
         for (int i = 0; i < corePoolSize; i++) {
-            addTaskWorker();
+            taskWorkers.add(threadFactory.newThread(new TaskWorker()));
         }
+        taskWorkers.forEach(Thread::start);
     }
 
     private boolean runStateOf(int c) {
-        return (this.runState == c);
+        return ((this.runState & c) == c);
     }
 
     @Override
     public void execute(Runnable command) {
         if (runStateOf(RUNNING)) {
-            final ReentrantLock mainLock = this.mainLock;
-            mainLock.lock();
-            try {
+            synchronized (workQueue) {
                 workQueue.offer(command);
-            } finally {
-                mainLock.unlock();
+                workQueue.notifyAll();
             }
         } else {
             throw new IllegalStateException("Состояние пула не допускает добавление новых задач.");
@@ -65,38 +56,19 @@ public class CustomThreadPool extends AbstractExecutorService {
     @Override
     public void shutdown() {
         this.runState = SHUTDOWN;
-
-        final ReentrantLock mainLock = this.mainLock;
-        mainLock.lock();
-        try {
-            for (TaskWorker taskWorker : taskWorkers) {
-                Thread t = taskWorker.thread;
-                if (!t.isInterrupted()) {
-                    try {
-                        //t.interrupt();
-                        t.join();
-                    } catch (InterruptedException | SecurityException e) {
-                    }
-                }
-            }
-        } finally {
-            mainLock.unlock();
-        }
     }
 
     @Override
     public List<Runnable> shutdownNow() {
-        this.runState = STOP;
+        this.runState = TERMINATED;
+        taskWorkers.forEach(Thread::interrupt);
 
-        for (TaskWorker taskWorker : taskWorkers)
-            taskWorker.interruptIfStarted();
-
-        return new ArrayList<>(taskWorkers);
+        return new ArrayList<>(workQueue);
     }
 
     @Override
     public boolean isShutdown() {
-        return runStateOf(SHUTDOWN);
+        return runStateOf(SHUTDOWN) | runStateOf(TERMINATED);
     }
 
     @Override
@@ -105,96 +77,33 @@ public class CustomThreadPool extends AbstractExecutorService {
     }
 
     @Override
-    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
-        long nanos = unit.toNanos(timeout);
-        final ReentrantLock mainLock = this.mainLock;
-        mainLock.lock();
-        try {
-            while (!runStateOf(TERMINATED)) {
-                if (nanos <= 0L) return false;
-                nanos = termination.awaitNanos(nanos);
-            }
-            return true;
-        } finally {
-            mainLock.unlock();
-        }
-    }
-
-    private void addTaskWorker() {
-        boolean workerStarted = false;
-        boolean workerAdded = false;
-        TaskWorker w = null;
-        try {
-            w = new TaskWorker();
-            final Thread t = w.thread;
-            if (t != null) {
-                final ReentrantLock mainLock = this.mainLock;
-                mainLock.lock();
-                try {
-                    taskWorkers.add(w);
-                    workerAdded = true;
-                } finally {
-                    mainLock.unlock();
-                }
-                if (workerAdded) {
-                    t.start();
-                    workerStarted = true;
-                }
-            }
-        } finally {
-            if (!workerStarted)
-                if (w != null)
-                    taskWorkers.remove(w);
-        }
+    public boolean awaitTermination(long timeout, TimeUnit unit) {
+        return false;
     }
 
     private Runnable getTask() {
         Runnable r = null;
-        if (!workQueue.isEmpty()) {
-            final ReentrantLock mainLock = this.mainLock;
-            mainLock.lock();
-            try {
+        synchronized (workQueue) {
+            if (!workQueue.isEmpty()) {
                 r = workQueue.poll();
-            } finally {
-                mainLock.unlock();
+            } else {
+                try {
+                    workQueue.wait();
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
             }
         }
         return r;
     }
 
-    final void runTaskWorker(TaskWorker w) {
-        Runnable task;
-        while (runStateOf(RUNNING)) {
-            try {
+    private final class TaskWorker implements Runnable {
+        public void run() {
+            Runnable task;
+            while (runStateOf(RUNNING)) {
                 task = getTask();
                 if (task != null)
                     task.run();
-            } finally {
-                w.completedTasks++;
-            }
-        }
-    }
-
-    private final class TaskWorker implements Runnable {
-        final Thread thread;
-
-        volatile long completedTasks;
-
-        TaskWorker() {
-            this.thread = getThreadFactory().newThread(this);
-        }
-
-        public void run() {
-            runTaskWorker(this);
-        }
-
-        void interruptIfStarted() {
-            Thread t = thread;
-            if (!t.isInterrupted()) {
-                try {
-                    t.interrupt();
-                } catch (SecurityException e) {
-                }
             }
         }
     }
